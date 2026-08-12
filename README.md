@@ -1,5 +1,7 @@
 # zkp_v2v
 
+📄 **[Project Report](https://drive.google.com/file/d/1lYkKiEHiWKHmddE38YAt9aOG1eKRrIaN/view?usp=drive_link)**
+
 ## Overview
 `zkp_v2v` is a high-performance cryptographic backend designed to augment Vehicle-to-Vehicle (V2V) energy sharing frameworks with robust privacy guarantees. 
 
