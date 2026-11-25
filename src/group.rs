@@ -4,7 +4,8 @@
 //!   P = RFC 2409 IKE Group 2 safe prime (1024-bit)
 //!   G = 2
 //!   Q = (P - 1) / 2
-//!   H = G^seed mod P, where seed = SHA-256("V2V_ZKP_h_v1") as big-endian u256 mod Q
+//!   H = u^2 mod P where u is derived via domain-separated SHA-256 hash-to-subgroup
+//!       (nothing-up-my-sleeve construction — nobody knows log_G(H))
 
 use num_bigint::{BigUint, RandBigInt};
 use num_traits::One;
@@ -31,23 +32,43 @@ pub struct PedersenCommitment {
 impl PedersenCommitment {
     /// Construct a new PedersenCommitment with the IKE Group 2 parameters.
     ///
-    /// H is derived deterministically from the seed "V2V_ZKP_h_v1":
-    ///   seed = SHA-256("V2V_ZKP_h_v1") interpreted as big-endian u256, mod Q
-    ///   H    = G^seed mod P
+    /// H is derived via nothing-up-my-sleeve hash-to-subgroup (NOT G^seed):
+    ///   u = expand_sha256("V2V_ZKP_h_v2_num") mod (P - 3) + 2
+    ///   H = u^2 mod P  (projects u directly into prime-order-Q subgroup G_Q)
+    /// Because H is never computed by raising G to a known exponent, nobody
+    /// knows log_G(H), preserving computational binding.
     pub fn new() -> Self {
         let p = BigUint::parse_bytes(P_HEX.as_bytes(), 16)
             .expect("P_HEX is a valid hex constant");
         let g = BigUint::from(2u32);
         let q = (&p - BigUint::one()) / BigUint::from(2u32);
 
-        // H derivation: seed = SHA-256("V2V_ZKP_h_v1") as big-endian u256 mod Q
-        let mut hasher = Sha256::new();
-        hasher.update(b"V2V_ZKP_h_v1");
-        let hash_bytes = hasher.finalize();
-        let seed = BigUint::from_bytes_be(&hash_bytes) % &q;
-        let h = g.modpow(&seed, &p);
+        let mut u_bytes = [0u8; 128];
+        for chunk_idx in 0u8..4 {
+            let mut hasher = Sha256::new();
+            hasher.update(b"V2V_ZKP_h_v2_num");
+            hasher.update([chunk_idx]);
+            let digest = hasher.finalize();
+            let start = (chunk_idx as usize) * 32;
+            u_bytes[start..start + 32].copy_from_slice(&digest);
+        }
+        let u = (BigUint::from_bytes_be(&u_bytes) % (&p - BigUint::from(3u32)))
+            + BigUint::from(2u32);
+        let h = u.modpow(&BigUint::from(2u32), &p);
+        assert!(
+            h != BigUint::one() && h != g && h.modpow(&q, &p) == BigUint::one(),
+            "derived H must be a non-trivial generator of subgroup G_Q"
+        );
 
         PedersenCommitment { p, g, h, q }
+    }
+
+    /// Check that `elem` lies in the prime-order-Q subgroup G_Q of Z*_P:
+    ///   1 <= elem < P  and  elem^Q == 1 (mod P).
+    pub fn is_valid_element(&self, elem: &BigUint) -> bool {
+        elem >= &BigUint::one()
+            && elem < &self.p
+            && elem.modpow(&self.q, &self.p) == BigUint::one()
     }
 
     /// Commit to value `x` with randomness `r`: Cm(x,r) = G^x · H^r mod P
@@ -183,5 +204,10 @@ mod tests {
         let pc = PedersenCommitment::new();
         assert_ne!(pc.h, pc.g, "H must differ from G");
         assert_ne!(pc.h, BigUint::one(), "H must not be 1");
+        assert!(pc.is_valid_element(&pc.h), "H must be in prime-order subgroup G_Q");
+        assert!(pc.is_valid_element(&pc.g), "G must be in prime-order subgroup G_Q");
+        // P - 1 has order 2 (not in G_Q) and must be rejected.
+        let p_minus_1 = &pc.p - BigUint::one();
+        assert!(!pc.is_valid_element(&p_minus_1), "P-1 is outside G_Q");
     }
 }

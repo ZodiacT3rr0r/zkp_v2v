@@ -110,6 +110,9 @@ pub fn zkpcm_prove(pc: &PedersenCommitment, x: &BigUint, r: &BigUint) -> ZkpCmPr
 /// Verify a ZkpCm proof.
 #[allow(non_snake_case)]
 pub fn zkpcm_verify(pc: &PedersenCommitment, proof: &ZkpCmProof) -> bool {
+    if !pc.is_valid_element(&proof.cm) || !pc.is_valid_element(&proof.C0) {
+        return false;
+    }
     let b = fiat_shamir(&[&proof.cm, &proof.C0], &pc.q);
     // lhs = G^zx · H^zr mod P
     let lhs = pc.commit(&proof.zx, &proof.zr);
@@ -214,6 +217,12 @@ pub fn or_bit_prove(
 /// Verify an OR-bit proof against commitment `cm`.
 #[allow(non_snake_case)]
 pub fn or_bit_verify(pc: &PedersenCommitment, cm: &BigUint, proof: &OrBitProof) -> bool {
+    if !pc.is_valid_element(cm)
+        || !pc.is_valid_element(&proof.C0_0)
+        || !pc.is_valid_element(&proof.C0_1)
+    {
+        return false;
+    }
     let beta = fiat_shamir(&[cm, &proof.C0_0, &proof.C0_1], &pc.q);
 
     // Check (b0 + b1) mod Q == beta
@@ -316,10 +325,17 @@ pub fn zkpnn_prove(
         product = (&product * &cm_pow) % &pc.p;
     }
 
-    // Schnorr-like proof that ratio = H^delta_r
+    // Schnorr-like proof that ratio = H^delta_r (binds cm, product, sc_C0, and all bit_cms)
     let rp = pc.rand_zq();
     let sc_C0 = pc.h.modpow(&rp, &pc.p);
-    let beta = fiat_shamir(&[&cm, &product, &sc_C0], &pc.q);
+    let mut transcript: Vec<&BigUint> = Vec::with_capacity(3 + bit_cms.len());
+    transcript.push(&cm);
+    transcript.push(&product);
+    transcript.push(&sc_C0);
+    for bcm in &bit_cms {
+        transcript.push(bcm);
+    }
+    let beta = fiat_shamir(&transcript, &pc.q);
     let sc_zr = (&rp + &beta * &delta_r) % &pc.q;
 
     Ok(ZkpNNProof {
@@ -337,7 +353,10 @@ pub fn zkpnn_prove(
 pub fn zkpnn_verify(pc: &PedersenCommitment, proof: &ZkpNNProof) -> bool {
     let bits = proof.bits as usize;
 
-    if proof.bit_cms.len() != bits || proof.bit_pfs.len() != bits {
+    if bits == 0 || proof.bit_cms.len() != bits || proof.bit_pfs.len() != bits {
+        return false;
+    }
+    if !pc.is_valid_element(&proof.cm) || !pc.is_valid_element(&proof.sc_C0) {
         return false;
     }
 
@@ -361,7 +380,14 @@ pub fn zkpnn_verify(pc: &PedersenCommitment, proof: &ZkpNNProof) -> bool {
     let ratio = (&product * &cm_inv) % &pc.p;
 
     // Verify Schnorr-like proof
-    let beta = fiat_shamir(&[&proof.cm, &product, &proof.sc_C0], &pc.q);
+    let mut transcript: Vec<&BigUint> = Vec::with_capacity(3 + proof.bit_cms.len());
+    transcript.push(&proof.cm);
+    transcript.push(&product);
+    transcript.push(&proof.sc_C0);
+    for bcm in &proof.bit_cms {
+        transcript.push(bcm);
+    }
+    let beta = fiat_shamir(&transcript, &pc.q);
     let lhs = pc.h.modpow(&proof.sc_zr, &pc.p);
     let rhs = (&proof.sc_C0 * ratio.modpow(&beta, &pc.p)) % &pc.p;
 
@@ -440,9 +466,18 @@ pub fn zkpsum_prove(
 /// Verify a sum proof.
 #[allow(non_snake_case)]
 pub fn zkpsum_verify(pc: &PedersenCommitment, proof: &ZkpSumProof) -> bool {
-    // Recompute combined from individual commitments
+    if proof.cms.is_empty()
+        || !pc.is_valid_element(&proof.combined)
+        || !pc.is_valid_element(&proof.C0)
+    {
+        return false;
+    }
+    // Recompute combined from individual commitments after validating subgroup membership
     let mut recomputed = BigUint::one();
     for cmi in &proof.cms {
+        if !pc.is_valid_element(cmi) {
+            return false;
+        }
         recomputed = (&recomputed * cmi) % &pc.p;
     }
     if recomputed != proof.combined {

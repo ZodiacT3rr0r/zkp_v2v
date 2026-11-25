@@ -1,19 +1,23 @@
 //! Fiat-Shamir heuristic for non-interactive challenge derivation.
 //!
-//! challenge = SHA-256(decimal(e0) || decimal(e1) || ...) mod Q
-//! where decimal(x) = base-10 string of BigUint, no leading zeros, no separator.
+//! Uses domain separation and explicit 8-byte big-endian length prefixes per element:
+//!   challenge = SHA-256("V2V_ZKP_FS_v2" || count:u64_be || [len_i:u64_be || bytes_i]...) mod Q
+//! preventing concatenation ambiguity (e.g., [12, 3] vs [1, 23]).
 
 use num_bigint::BigUint;
-use sha2::{Sha256, Digest};
+use sha2::{Digest, Sha256};
 
-/// Compute a Fiat-Shamir challenge from a slice of BigUint elements.
-///
-/// The challenge is SHA-256 of the concatenation of each element's
-/// decimal string representation, reduced modulo `q`.
+const FS_DOMAIN_TAG: &[u8] = b"V2V_ZKP_FS_v2";
+
+/// Compute a length-prefixed, domain-separated Fiat-Shamir challenge from a slice of BigUint elements.
 pub fn fiat_shamir(elems: &[&BigUint], q: &BigUint) -> BigUint {
     let mut hasher = Sha256::new();
+    hasher.update(FS_DOMAIN_TAG);
+    hasher.update((elems.len() as u64).to_be_bytes());
     for e in elems {
-        hasher.update(e.to_str_radix(10).as_bytes());
+        let bytes = e.to_bytes_be();
+        hasher.update((bytes.len() as u64).to_be_bytes());
+        hasher.update(&bytes);
     }
     let hash_bytes = hasher.finalize();
     BigUint::from_bytes_be(&hash_bytes) % q
@@ -24,7 +28,6 @@ mod tests {
     use super::*;
     use num_bigint::BigUint;
 
-    /// Q for testing — use the actual IKE Group 2 Q.
     fn test_q() -> BigUint {
         let pc = crate::group::PedersenCommitment::new();
         pc.q
@@ -65,5 +68,13 @@ mod tests {
         let a = BigUint::from(999_999u32);
         let result = fiat_shamir(&[&a], &q);
         assert!(result < q, "single-element call must not panic and result < Q");
+    }
+
+    #[test]
+    fn test_fiat_shamir_length_prefixed_no_concat_collision() {
+        let q = test_q();
+        let r1 = fiat_shamir(&[&BigUint::from(12u32), &BigUint::from(3u32)], &q);
+        let r2 = fiat_shamir(&[&BigUint::from(1u32), &BigUint::from(23u32)], &q);
+        assert_ne!(r1, r2, "length-prefixed transcript must separate [12, 3] from [1, 23]");
     }
 }

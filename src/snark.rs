@@ -18,7 +18,9 @@ use std::path::{Path, PathBuf};
 
 use ark_bn254::{Bn254, Fr};
 use ark_circom::{CircomBuilder, CircomConfig, CircomReduction};
-use ark_groth16::{prepare_verifying_key, Groth16, Proof};
+use ark_groth16::{
+    prepare_verifying_key, Groth16, PreparedVerifyingKey, Proof, ProvingKey,
+};
 use ark_serialize::{CanonicalDeserialize, CanonicalSerialize};
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
@@ -32,16 +34,16 @@ use serde::{Deserialize, Serialize};
 pub struct ComparisonProof {
     pub pid: u64,
     pub cid: u64,
-    pub utility_a: u64,
-    pub utility_b: u64,
     pub proof_hex: String,
 }
 
-/// Loads Circom circuit artifacts and generates/verifies Groth16 proofs.
+/// Loads Circom circuit artifacts once and caches the Groth16 proving key
+/// and prepared verifying key in memory for fast repeated proving/verification.
 pub struct SnarkProver {
     r1cs_path: PathBuf,
     wasm_path: PathBuf,
-    zkey_path: PathBuf,
+    pk: ProvingKey<Bn254>,
+    pvk: PreparedVerifyingKey<Bn254>,
 }
 
 impl SnarkProver {
@@ -52,7 +54,7 @@ impl SnarkProver {
     ///   - `comparison_js/comparison.wasm`
     ///   - `comparison_final.zkey`
     ///
-    /// Returns Err with the filename if any file is missing.
+    /// Parses `comparison_final.zkey` and prepares the verifying key once at startup.
     pub fn new(circuit_dir: &Path) -> Result<Self, String> {
         let r1cs_path = circuit_dir.join("comparison.r1cs");
         let wasm_path = circuit_dir
@@ -70,10 +72,17 @@ impl SnarkProver {
             return Err(format!("missing: {}", zkey_path.display()));
         }
 
+        let zkey_file = File::open(&zkey_path)
+            .map_err(|e| format!("zkey open error: {}", e))?;
+        let (pk, _) = ark_circom::read_zkey(&mut BufReader::new(zkey_file))
+            .map_err(|e| format!("zkey read error: {}", e))?;
+        let pvk = prepare_verifying_key(&pk.vk);
+
         Ok(Self {
             r1cs_path,
             wasm_path,
-            zkey_path,
+            pk,
+            pvk,
         })
     }
 
@@ -105,20 +114,14 @@ impl SnarkProver {
             .build()
             .map_err(|e| format!("circuit build error: {}", e))?;
 
-        // Load proving key from zkey file
-        let zkey_file = File::open(&self.zkey_path)
-            .map_err(|e| format!("zkey open error: {}", e))?;
-        let (pk, _) = ark_circom::read_zkey(&mut BufReader::new(zkey_file))
-            .map_err(|e| format!("zkey read error: {}", e))?;
-
-        // Generate Groth16 proof using CircomReduction (matches snarkjs zkey format)
+        // Generate Groth16 proof using cached proving key + CircomReduction
         let proof =
             Groth16::<Bn254, CircomReduction>::create_random_proof_with_reduction(
-                circuit, &pk, &mut OsRng,
+                circuit, &self.pk, &mut OsRng,
             )
             .map_err(|e| format!("proof generation error: {}", e))?;
 
-        // Serialize proof to hex
+        // Serialize proof to compressed 128-byte hex
         let mut proof_bytes = Vec::new();
         proof
             .serialize_compressed(&mut proof_bytes)
@@ -127,13 +130,11 @@ impl SnarkProver {
         Ok(ComparisonProof {
             pid,
             cid,
-            utility_a,
-            utility_b,
             proof_hex: hex::encode(proof_bytes),
         })
     }
 
-    /// Verify a comparison proof.
+    /// Verify a comparison proof using the cached PreparedVerifyingKey (~2 ms).
     ///
     /// Returns Ok(true) if the proof is valid, Ok(false) if invalid.
     pub fn verify_comparison(&self, proof: &ComparisonProof) -> Result<bool, String> {
@@ -143,17 +144,10 @@ impl SnarkProver {
         let groth_proof = Proof::<Bn254>::deserialize_compressed(&proof_bytes[..])
             .map_err(|e| format!("proof deserialization error: {}", e))?;
 
-        // Load verification key from zkey
-        let zkey_file = File::open(&self.zkey_path)
-            .map_err(|e| format!("zkey open error: {}", e))?;
-        let (pk, _) = ark_circom::read_zkey(&mut BufReader::new(zkey_file))
-            .map_err(|e| format!("zkey read error: {}", e))?;
-        let pvk = prepare_verifying_key(&pk.vk);
-
         // Public output: result = 1 (the circuit enforces utility_a > utility_b)
         let public_inputs = vec![Fr::from(1u64)];
 
-        let valid = Groth16::<Bn254>::verify_proof(&pvk, &groth_proof, &public_inputs)
+        let valid = Groth16::<Bn254>::verify_proof(&self.pvk, &groth_proof, &public_inputs)
             .map_err(|e| format!("verification error: {}", e))?;
 
         Ok(valid)
